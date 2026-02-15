@@ -102,6 +102,21 @@ let lastSelectionText = "";
 let activeTooltipEl = null;
 let activeSelectionText = "";
 
+// Vocab detail popup state
+let vocabDetailPopup = null;
+let popupOpen = false;
+let tooltipHovered = false;
+
+// HTML escape helper
+function escapeHTML(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function showTranslationTooltip(arg, eOrX, maybeY) {
   // Accept either (word, translation, x, y) legacy signature or
   // ({word, meaning, isLoading}, event)
@@ -210,6 +225,33 @@ function showTranslationTooltip(arg, eOrX, maybeY) {
 
   translationTooltip = tooltip;
   try { activeTooltipEl = tooltip; } catch (e) {}
+
+  // Make tooltip interactive: hover to keep open, click to open detail popup
+  tooltip.style.cursor = 'pointer';
+  tooltip.addEventListener('mouseenter', () => {
+    tooltipHovered = true;
+    if (translationTimeout) { clearTimeout(translationTimeout); translationTimeout = null; }
+    showClickHint(tooltip);
+  });
+  tooltip.addEventListener('mouseleave', () => {
+    tooltipHovered = false;
+    if (!popupOpen) {
+      translationTimeout = setTimeout(() => hideTranslationTooltip(), 1500);
+    }
+  });
+  // Stop mousedown from propagating so document-level handlers don't interfere
+  tooltip.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
+  });
+  tooltip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const wordEl = tooltip.querySelector('#vocab-tooltip-content');
+    const clickedWord = wordEl?.dataset?.word;
+    if (clickedWord) {
+      openVocabDetailPopup(clickedWord, tooltip);
+    }
+  });
 
   // Measure and place: prefer above the cursor, fall back below if not enough space
   const rect = tooltip.getBoundingClientRect();
@@ -365,8 +407,11 @@ function cleanupInjectedUI() {
 
     // 2) Remove overlays by known IDs if you used them
     document.getElementById("vocab-translation-tooltip")?.remove();
+    document.getElementById("vocab-detail-popup")?.remove();
     document.getElementById("vocab-panel")?.remove();
     document.getElementById("vocab-selection-popover")?.remove();
+    vocabDetailPopup = null;
+    popupOpen = false;
 
     // 3) Unwrap word spans (if you wrapped words)
     // If you ever wrap words like <span class="lr-word">text</span>, unwrap them:
@@ -382,6 +427,432 @@ function cleanupInjectedUI() {
   } catch (err) {
     console.warn('🔵 [Content Script] cleanupInjectedUI error:', err);
   }
+}
+
+// --- Vocab Detail Popup ---
+
+// Fetch detailed vocab data from background service worker
+async function fetchVocabDetail(word) {
+  if (!word) return null;
+  const cleanWord = word.trim().toLowerCase();
+
+  // Try port-based communication first
+  try {
+    if (chrome?.runtime?.connect) {
+      const port = chrome.runtime.connect({ name: 'vocab-detail-port' });
+      const detail = await new Promise((resolve) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+          if (!settled) { settled = true; try { port.disconnect(); } catch {} resolve(null); }
+        }, 5000);
+
+        port.onMessage.addListener((msg) => {
+          if (settled) return;
+          if (msg?.type === 'VOCAB_DETAIL_RESULT') {
+            settled = true;
+            clearTimeout(timeout);
+            try { port.disconnect(); } catch {}
+            resolve(msg.detail || null);
+          }
+        });
+
+        port.postMessage({ type: 'FETCH_VOCAB_DETAIL', word: cleanWord });
+      });
+
+      if (detail) return detail;
+    }
+  } catch (e) {
+    console.warn('[Content] fetchVocabDetail port failed:', e);
+  }
+
+  // Fallback: sendMessage
+  try {
+    return await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: 'FETCH_VOCAB_DETAIL', word: cleanWord },
+        (response) => {
+          if (chrome.runtime.lastError) { resolve(null); return; }
+          resolve(response?.detail || null);
+        }
+      );
+    });
+  } catch (e) {
+    console.warn('[Content] fetchVocabDetail sendMessage failed:', e);
+    return null;
+  }
+}
+
+// Popup HTML: loading state
+function buildPopupLoadingHTML(word) {
+  return `
+    <div style="padding:16px 20px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="font-size:20px; font-weight:600;">${escapeHTML(word)}</div>
+      <div class="vocab-popup-close" style="cursor:pointer; font-size:20px; color:rgba(255,255,255,0.5); padding:4px 8px; line-height:1;">&times;</div>
+    </div>
+    <div style="padding:32px 20px; text-align:center; color:rgba(255,255,255,0.5); font-size:13px;">
+      <div style="margin-bottom:8px; font-size:18px;">⏳</div>
+      Loading details...
+    </div>
+  `;
+}
+
+// Popup HTML: error state
+function buildPopupErrorHTML(word, errorMsg) {
+  return `
+    <div style="padding:16px 20px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="font-size:20px; font-weight:600;">${escapeHTML(word)}</div>
+      <div class="vocab-popup-close" style="cursor:pointer; font-size:20px; color:rgba(255,255,255,0.5); padding:4px 8px; line-height:1;">&times;</div>
+    </div>
+    <div style="padding:24px 20px; text-align:center; color:rgba(255,255,255,0.45); font-size:13px;">
+      ${escapeHTML(errorMsg)}
+    </div>
+  `;
+}
+
+// Popup HTML: full content with tabs
+function buildPopupContentHTML(detail) {
+  const phoneticHTML = detail.phonetic
+    ? `<span style="font-size:13px; color:rgba(255,255,255,0.45); margin-left:8px; font-weight:400;">/${escapeHTML(detail.phonetic)}/</span>`
+    : '';
+
+  const speakerHTML = `<span class="vocab-popup-speaker" style="cursor:pointer; margin-left:8px; font-size:16px; color:rgba(255,255,255,0.5); transition:color 0.15s;" title="Listen">🔊</span>`;
+
+  // Build definitions pane
+  let defsHTML = '';
+  if (detail.definitions && detail.definitions.length > 0) {
+    for (const def of detail.definitions) {
+      defsHTML += `<div style="margin-bottom:14px;">`;
+      defsHTML += `<span style="display:inline-block; background:rgba(66,133,244,0.15); color:#8ab4f8; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:500; letter-spacing:0.3px; text-transform:lowercase;">${escapeHTML(def.pos)}</span>`;
+      if (def.definition) {
+        defsHTML += `<div style="font-size:13px; color:rgba(255,255,255,0.6); margin:6px 0 2px; line-height:1.4;">${escapeHTML(def.definition)}</div>`;
+      }
+      if (def.meanings && def.meanings.length > 0) {
+        defsHTML += `<div style="font-size:14px; color:rgba(255,255,255,0.95); margin-top:4px; line-height:1.5;">${def.meanings.map(m => escapeHTML(m)).join('，')}</div>`;
+      }
+      defsHTML += `</div>`;
+    }
+  } else {
+    defsHTML = `<div style="color:rgba(255,255,255,0.35); font-size:13px; padding:12px 0;">No definitions available.</div>`;
+  }
+
+  // Build examples pane
+  let examplesHTML = '';
+  if (detail.examples && detail.examples.length > 0) {
+    for (const ex of detail.examples) {
+      // ex contains <b> tags around the word — sanitize but keep <b>
+      const sanitized = ex.replace(/<(?!\/?b>)[^>]*>/gi, '');
+      examplesHTML += `<div style="margin-bottom:10px; padding:10px 12px; background:rgba(255,255,255,0.03); border-left:2px solid rgba(66,133,244,0.3); border-radius:0 6px 6px 0; font-size:13px; color:rgba(255,255,255,0.8); line-height:1.6;">${sanitized}</div>`;
+    }
+  } else {
+    examplesHTML = `<div style="color:rgba(255,255,255,0.35); font-size:13px; padding:12px 0;">No examples available.</div>`;
+  }
+
+  // Build phrases/synonyms pane
+  let phrasesHTML = '';
+  if (detail.synonyms && detail.synonyms.length > 0) {
+    phrasesHTML += `<div style="font-size:11px; color:rgba(255,255,255,0.35); margin-bottom:8px; text-transform:uppercase; letter-spacing:0.5px;">Synonyms</div>`;
+    for (const synGroup of detail.synonyms) {
+      phrasesHTML += `<div style="margin-bottom:12px;">`;
+      phrasesHTML += `<span style="display:inline-block; background:rgba(66,133,244,0.15); color:#8ab4f8; padding:2px 8px; border-radius:4px; font-size:11px; margin-bottom:6px;">${escapeHTML(synGroup.pos)}</span>`;
+      phrasesHTML += `<div style="margin-top:4px; display:flex; flex-wrap:wrap; gap:6px;">`;
+      for (const w of synGroup.words) {
+        phrasesHTML += `<span style="background:rgba(255,255,255,0.06); padding:4px 10px; border-radius:12px; font-size:12px; color:rgba(255,255,255,0.75);">${escapeHTML(w)}</span>`;
+      }
+      phrasesHTML += `<div></div>`;
+    }
+  }
+  if (detail.alternatives && detail.alternatives.length > 0) {
+    phrasesHTML += `<div style="margin-top:${detail.synonyms?.length ? '16' : '0'}px;"><div style="font-size:11px; color:rgba(255,255,255,0.35); margin-bottom:8px; text-transform:uppercase; letter-spacing:0.5px;">Alternative translations</div>`;
+    phrasesHTML += `<div style="display:flex; flex-wrap:wrap; gap:6px;">`;
+    for (const alt of detail.alternatives) {
+      phrasesHTML += `<span style="background:rgba(255,255,255,0.06); padding:4px 10px; border-radius:12px; font-size:13px; color:rgba(255,255,255,0.75);">${escapeHTML(alt)}</span>`;
+    }
+    phrasesHTML += `<div></div>`;
+  }
+  if (!phrasesHTML) {
+    phrasesHTML = `<div style="color:rgba(255,255,255,0.35); font-size:13px; padding:12px 0;">No phrases available.</div>`;
+  }
+
+  return `
+    <div style="padding:14px 18px 10px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="display:flex; align-items:center; flex-wrap:wrap; gap:2px;">
+        <span style="font-size:20px; font-weight:600;">${escapeHTML(detail.word)}</span>
+        ${phoneticHTML}
+        ${speakerHTML}
+      </div>
+      <div class="vocab-popup-close" style="cursor:pointer; font-size:20px; color:rgba(255,255,255,0.5); padding:4px 8px; line-height:1; flex-shrink:0;">&times;</div>
+    </div>
+    <div style="padding:8px 18px 10px; font-size:15px; color:rgba(255,255,255,0.85); border-bottom:1px solid rgba(255,255,255,0.06);">
+      ${escapeHTML(detail.translation)}
+    </div>
+    <div class="vocab-popup-tabs" style="display:flex; border-bottom:1px solid rgba(255,255,255,0.06); padding:0 14px; gap:0;">
+      <div class="vocab-tab active" data-tab="definitions" style="padding:9px 12px; font-size:13px; cursor:pointer; color:rgba(255,255,255,0.9); border-bottom:2px solid #8ab4f8; margin-bottom:-1px; transition:color 0.15s;">解释</div>
+      <div class="vocab-tab" data-tab="examples" style="padding:9px 12px; font-size:13px; cursor:pointer; color:rgba(255,255,255,0.45); border-bottom:2px solid transparent; margin-bottom:-1px; transition:color 0.15s;">例子</div>
+      <div class="vocab-tab" data-tab="phrases" style="padding:9px 12px; font-size:13px; cursor:pointer; color:rgba(255,255,255,0.45); border-bottom:2px solid transparent; margin-bottom:-1px; transition:color 0.15s;">常用短语</div>
+    </div>
+    <div class="vocab-popup-tab-content" style="padding:14px 18px; overflow-y:auto; flex:1; max-height:260px;">
+      <div class="vocab-tab-pane" data-pane="definitions">${defsHTML}</div>
+      <div class="vocab-tab-pane" data-pane="examples" style="display:none;">${examplesHTML}</div>
+      <div class="vocab-tab-pane" data-pane="phrases" style="display:none;">${phrasesHTML}</div>
+    </div>
+    <div style="padding:10px 18px 14px; border-top:1px solid rgba(255,255,255,0.06);">
+      <button class="vocab-save-obsidian" style="width:100%; padding:8px 0; background:rgba(66,133,244,0.1); color:#8ab4f8; border:1px solid rgba(66,133,244,0.25); border-radius:6px; font-size:13px; font-weight:500; cursor:pointer; font-family:inherit; transition:all 0.15s;">Save to Obsidian</button>
+    </div>
+  `;
+}
+
+// Text-to-Speech
+function speakWord(word) {
+  if (!word) return;
+  try {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(word);
+    utterance.lang = 'en-US';
+    utterance.rate = 0.9;
+    utterance.pitch = 1;
+    window.speechSynthesis.speak(utterance);
+  } catch (e) {
+    console.warn('[Content] speechSynthesis failed:', e);
+  }
+}
+
+// Build enriched save text from vocab detail
+function buildObsidianSaveText(detail) {
+  let text = detail.word;
+  if (detail.phonetic) text += ` /${detail.phonetic}/`;
+  text += ` — ${detail.translation}`;
+  if (detail.definitions && detail.definitions.length > 0) {
+    const defSummary = detail.definitions
+      .map(d => `(${d.pos}) ${d.meanings.join(', ')}`)
+      .join('; ');
+    text += ` | ${defSummary}`;
+  }
+  return text;
+}
+
+// Attach interactions to the popup (tabs, TTS, save, close)
+function attachPopupInteractions(popup, detail) {
+  // Close button
+  popup.querySelector('.vocab-popup-close')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    hideVocabDetailPopup();
+  });
+
+  // Tab switching
+  const tabs = popup.querySelectorAll('.vocab-tab');
+  const panes = popup.querySelectorAll('.vocab-tab-pane');
+  tabs.forEach(tab => {
+    tab.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const tabName = tab.dataset.tab;
+      tabs.forEach(t => {
+        t.style.color = 'rgba(255,255,255,0.45)';
+        t.style.borderBottomColor = 'transparent';
+        t.classList.remove('active');
+      });
+      tab.style.color = 'rgba(255,255,255,0.9)';
+      tab.style.borderBottomColor = '#8ab4f8';
+      tab.classList.add('active');
+      panes.forEach(p => {
+        p.style.display = p.dataset.pane === tabName ? '' : 'none';
+      });
+    });
+  });
+
+  // Text-to-Speech
+  const speaker = popup.querySelector('.vocab-popup-speaker');
+  if (speaker) {
+    speaker.addEventListener('click', (e) => {
+      e.stopPropagation();
+      speakWord(detail.word);
+    });
+    speaker.addEventListener('mouseenter', () => { speaker.style.color = 'rgba(255,255,255,0.85)'; });
+    speaker.addEventListener('mouseleave', () => { speaker.style.color = 'rgba(255,255,255,0.5)'; });
+  }
+
+  // Save to Obsidian
+  const saveBtn = popup.querySelector('.vocab-save-obsidian');
+  if (saveBtn) {
+    saveBtn.addEventListener('mouseenter', () => {
+      saveBtn.style.background = 'rgba(66,133,244,0.2)';
+    });
+    saveBtn.addEventListener('mouseleave', () => {
+      saveBtn.style.background = 'rgba(66,133,244,0.1)';
+    });
+    saveBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const saveText = buildObsidianSaveText(detail);
+      sendSaveToObsidian(saveText);
+      saveBtn.textContent = '✓ Saved!';
+      saveBtn.style.background = 'rgba(46,125,50,0.2)';
+      saveBtn.style.color = '#81c784';
+      saveBtn.style.borderColor = 'rgba(46,125,50,0.4)';
+      setTimeout(() => {
+        if (saveBtn.isConnected) {
+          saveBtn.textContent = 'Save to Obsidian';
+          saveBtn.style.background = 'rgba(66,133,244,0.1)';
+          saveBtn.style.color = '#8ab4f8';
+          saveBtn.style.borderColor = 'rgba(66,133,244,0.25)';
+        }
+      }, 2000);
+    });
+  }
+
+  // Prevent events from propagating to page
+  popup.addEventListener('mousedown', (e) => e.stopPropagation());
+  popup.addEventListener('click', (e) => e.stopPropagation());
+}
+
+// Position popup using a pre-captured anchor rect (or center on screen)
+function positionPopupWithRect(popupEl, anchorRect) {
+  requestAnimationFrame(() => {
+    const popupRect = popupEl.getBoundingClientRect();
+    const margin = 12;
+
+    if (anchorRect && anchorRect.width > 0) {
+      // Prefer below the anchor
+      let top = anchorRect.bottom + 8;
+      let left = anchorRect.left + (anchorRect.width / 2) - (popupRect.width / 2);
+
+      // If not enough space below, try above
+      if (top + popupRect.height > window.innerHeight - margin) {
+        top = anchorRect.top - popupRect.height - 8;
+      }
+      // If still no space, center vertically
+      if (top < margin) {
+        top = Math.max(margin, (window.innerHeight - popupRect.height) / 2);
+      }
+
+      // Clamp horizontally
+      left = Math.max(margin, Math.min(left, window.innerWidth - popupRect.width - margin));
+
+      popupEl.style.left = `${Math.round(left)}px`;
+      popupEl.style.top = `${Math.round(top)}px`;
+    } else {
+      // Center on screen
+      popupEl.style.left = `${Math.round((window.innerWidth - popupRect.width) / 2)}px`;
+      popupEl.style.top = `${Math.round((window.innerHeight - popupRect.height) / 2)}px`;
+    }
+  });
+}
+
+// Hide and remove the vocab detail popup
+function hideVocabDetailPopup() {
+  if (!vocabDetailPopup) return;
+  try {
+    vocabDetailPopup.style.animation = 'fadeOut 0.15s ease-out';
+    const ref = vocabDetailPopup;
+    setTimeout(() => {
+      try { ref.remove(); } catch {}
+    }, 150);
+  } catch (e) {
+    try { vocabDetailPopup.remove(); } catch {}
+  }
+  vocabDetailPopup = null;
+  popupOpen = false;
+}
+
+// Open the vocab detail popup
+async function openVocabDetailPopup(word, tooltipEl) {
+  console.log('[Vocab] openVocabDetailPopup called for:', word);
+  if (popupOpen) hideVocabDetailPopup();
+
+  // Cancel tooltip auto-hide
+  if (translationTimeout) { clearTimeout(translationTimeout); translationTimeout = null; }
+
+  // Capture tooltip position BEFORE we hide it (since hide removes it from DOM)
+  let tooltipRect = null;
+  if (tooltipEl && tooltipEl.isConnected) {
+    try { tooltipRect = tooltipEl.getBoundingClientRect(); } catch (e) {}
+  }
+
+  // Create popup container
+  const popup = document.createElement('div');
+  popup.id = 'vocab-detail-popup';
+  popup.dataset.vocabExt = '1';
+  popup.style.cssText = `
+    position: fixed;
+    z-index: 1000002;
+    background: rgba(20, 20, 24, 0.96);
+    color: #fff;
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Microsoft YaHei', sans-serif;
+    max-width: 420px;
+    min-width: 300px;
+    width: 380px;
+    max-height: 480px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    backdrop-filter: blur(12px);
+    animation: fadeIn 0.2s ease-out;
+    pointer-events: auto;
+    visibility: hidden;
+  `;
+
+  // Show loading state
+  popup.innerHTML = buildPopupLoadingHTML(word);
+  document.body.appendChild(popup);
+
+  vocabDetailPopup = popup;
+  popupOpen = true;
+
+  // Position using the captured tooltip rect
+  positionPopupWithRect(popup, tooltipRect);
+  popup.style.visibility = 'visible';
+
+  // Close button handler for loading state
+  popup.querySelector('.vocab-popup-close')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    hideVocabDetailPopup();
+  });
+  popup.addEventListener('mousedown', (e) => e.stopPropagation());
+  popup.addEventListener('click', (e) => e.stopPropagation());
+
+  // Hide the tooltip now
+  hideTranslationTooltip();
+
+  // Fetch detailed data
+  try {
+    const detail = await fetchVocabDetail(word);
+    if (!vocabDetailPopup || !popupOpen) return; // popup was closed during fetch
+
+    if (detail) {
+      popup.innerHTML = buildPopupContentHTML(detail);
+      attachPopupInteractions(popup, detail);
+      // Re-position after content change (size may differ)
+      positionPopupWithRect(popup, tooltipRect);
+    } else {
+      popup.innerHTML = buildPopupErrorHTML(word, 'Could not fetch detailed information.');
+      popup.querySelector('.vocab-popup-close')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        hideVocabDetailPopup();
+      });
+    }
+  } catch (err) {
+    if (vocabDetailPopup && popupOpen) {
+      popup.innerHTML = buildPopupErrorHTML(word, String(err));
+      popup.querySelector('.vocab-popup-close')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        hideVocabDetailPopup();
+      });
+    }
+  }
+}
+
+// Show "Click for details" hint on tooltip hover
+function showClickHint(tooltipEl) {
+  if (tooltipEl.querySelector('.vocab-click-hint')) return;
+  const hint = document.createElement('div');
+  hint.className = 'vocab-click-hint';
+  hint.dataset.vocabExt = '1';
+  hint.style.cssText = 'font-size:10px; color:#8ab4f8; text-align:center; padding:3px 0 5px; border-top:1px solid rgba(255,255,255,0.08); margin-top:5px; text-decoration:underline; text-underline-offset:2px;';
+  hint.textContent = 'Click for details';
+  hint.addEventListener('mouseenter', () => { hint.style.color = '#aecbfa'; });
+  hint.addEventListener('mouseleave', () => { hint.style.color = '#8ab4f8'; });
+  const contentBox = tooltipEl.querySelector('#vocab-tooltip-content');
+  if (contentBox) contentBox.appendChild(hint);
 }
 
 // Helper: get selection bounding rect and text
@@ -770,12 +1241,17 @@ function enableAll() {
 // Event handlers (keep references so removeEventListener works)
 function onMouseUp(e) {
   if (!enabled) return;
+  // Don't trigger new translations while popup is open or tooltip is hovered
+  if (popupOpen || tooltipHovered) return;
   clearTimeout(translateTimer);
   translateTimer = setTimeout(() => translateSelectedText("mouseup"), 0);
 }
 
 function onSelectionChange(e) {
   if (!enabled) return;
+  // Don't trigger new translations while popup is open or tooltip is hovered
+  if (popupOpen || tooltipHovered) return;
+
   clearTimeout(translateTimer);
   translateTimer = setTimeout(() => translateSelectedText("selectionchange"), 120);
 
@@ -783,6 +1259,8 @@ function onSelectionChange(e) {
   if (!activeTooltipEl) return;
   clearTimeout(selHideTimer);
   selHideTimer = setTimeout(() => {
+    // Don't hide if popup is open or tooltip is being interacted with
+    if (popupOpen || tooltipHovered) return;
     const text = window.getSelection()?.toString().trim() || "";
     if (!text) {
       hideActiveTooltip();
@@ -796,13 +1274,16 @@ function onSelectionChange(e) {
 
 function onMouseDown(e) {
   if (!enabled) return;
-  // If tooltip not open, ignore the click-outside handling below
-  if (!activeTooltipEl && !translationTooltip) return;
+  // If nothing open, ignore
+  if (!activeTooltipEl && !translationTooltip && !vocabDetailPopup) return;
 
   // Click inside tooltip -> keep
   if (e.target?.closest?.("#vocab-translation-tooltip")) return;
+  // Click inside detail popup -> keep
+  if (e.target?.closest?.("#vocab-detail-popup")) return;
 
-  // Otherwise hide active tooltip immediately
+  // Otherwise hide popup and tooltip
+  hideVocabDetailPopup();
   hideActiveTooltip();
 
   // If selection collapses after click, hide selection tooltip
@@ -815,8 +1296,18 @@ function onMouseDown(e) {
   }, 0);
 }
 
-function onKeyDown(e) { if (e.key === "Escape") { lastSelectionText = ""; hideTranslationTooltip(); try { window.getSelection()?.removeAllRanges?.(); } catch (e) {} } }
-function onScroll() { hideTranslationTooltip(); }
+function onKeyDown(e) {
+  if (e.key === "Escape") {
+    if (popupOpen) {
+      hideVocabDetailPopup();
+      return; // close popup first; let user press Escape again to clear tooltip/selection
+    }
+    lastSelectionText = "";
+    hideTranslationTooltip();
+    try { window.getSelection()?.removeAllRanges?.(); } catch (e) {}
+  }
+}
+function onScroll() { hideTranslationTooltip(); hideVocabDetailPopup(); }
 
 function attachTranslationListeners() {
   document.addEventListener("mouseup", onMouseUp);
