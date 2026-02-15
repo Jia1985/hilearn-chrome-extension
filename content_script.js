@@ -385,6 +385,7 @@ function hideTranslationTooltip() {
   currentWord = null;
   lastSelectionText = "";
   activeSelectionText = "";
+  tooltipHovered = false;
 
 }
 
@@ -444,7 +445,7 @@ async function fetchVocabDetail(word) {
         let settled = false;
         const timeout = setTimeout(() => {
           if (!settled) { settled = true; try { port.disconnect(); } catch {} resolve(null); }
-        }, 5000);
+        }, 8000);
 
         port.onMessage.addListener((msg) => {
           if (settled) return;
@@ -580,7 +581,10 @@ function buildPopupContentHTML(detail) {
         ${phoneticHTML}
         ${speakerHTML}
       </div>
-      <div class="vocab-popup-close" style="cursor:pointer; font-size:20px; color:rgba(255,255,255,0.5); padding:4px 8px; line-height:1; flex-shrink:0;">&times;</div>
+      <div style="display:flex; align-items:center; gap:2px; flex-shrink:0;">
+        <div class="vocab-save-obsidian" title="Save to Obsidian" style="cursor:pointer; color:rgba(255,255,255,0.45); padding:4px 6px; line-height:1; border-radius:6px; transition:color 0.15s, background 0.15s; display:flex; align-items:center;"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></div>
+        <div class="vocab-popup-close" style="cursor:pointer; font-size:20px; color:rgba(255,255,255,0.5); padding:4px 8px; line-height:1;">&times;</div>
+      </div>
     </div>
     <div style="padding:8px 18px 10px; font-size:15px; color:rgba(255,255,255,0.85); border-bottom:1px solid rgba(255,255,255,0.06);">
       ${escapeHTML(detail.translation)}
@@ -594,9 +598,6 @@ function buildPopupContentHTML(detail) {
       <div class="vocab-tab-pane" data-pane="definitions">${defsHTML}</div>
       <div class="vocab-tab-pane" data-pane="examples" style="display:none;">${examplesHTML}</div>
       <div class="vocab-tab-pane" data-pane="phrases" style="display:none;">${phrasesHTML}</div>
-    </div>
-    <div style="padding:10px 18px 14px; border-top:1px solid rgba(255,255,255,0.06);">
-      <button class="vocab-save-obsidian" style="width:100%; padding:8px 0; background:rgba(66,133,244,0.1); color:#8ab4f8; border:1px solid rgba(66,133,244,0.25); border-radius:6px; font-size:13px; font-weight:500; cursor:pointer; font-family:inherit; transition:all 0.15s;">Save to Obsidian</button>
     </div>
   `;
 }
@@ -670,29 +671,34 @@ function attachPopupInteractions(popup, detail) {
     speaker.addEventListener('mouseleave', () => { speaker.style.color = 'rgba(255,255,255,0.5)'; });
   }
 
-  // Save to Obsidian
+  // Save to Obsidian (icon in header)
   const saveBtn = popup.querySelector('.vocab-save-obsidian');
   if (saveBtn) {
     saveBtn.addEventListener('mouseenter', () => {
-      saveBtn.style.background = 'rgba(66,133,244,0.2)';
+      saveBtn.style.color = '#8ab4f8';
+      saveBtn.style.background = 'rgba(66,133,244,0.15)';
     });
     saveBtn.addEventListener('mouseleave', () => {
-      saveBtn.style.background = 'rgba(66,133,244,0.1)';
+      if (!saveBtn.dataset.saved) {
+        saveBtn.style.color = 'rgba(255,255,255,0.45)';
+        saveBtn.style.background = 'transparent';
+      }
     });
     saveBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const saveText = buildObsidianSaveText(detail);
       sendSaveToObsidian(saveText);
-      saveBtn.textContent = '✓ Saved!';
-      saveBtn.style.background = 'rgba(46,125,50,0.2)';
+      // Fill the bookmark icon to indicate saved
+      saveBtn.dataset.saved = '1';
       saveBtn.style.color = '#81c784';
-      saveBtn.style.borderColor = 'rgba(46,125,50,0.4)';
+      saveBtn.style.background = 'rgba(46,125,50,0.15)';
+      saveBtn.querySelector('svg')?.setAttribute('fill', 'currentColor');
       setTimeout(() => {
         if (saveBtn.isConnected) {
-          saveBtn.textContent = 'Save to Obsidian';
-          saveBtn.style.background = 'rgba(66,133,244,0.1)';
-          saveBtn.style.color = '#8ab4f8';
-          saveBtn.style.borderColor = 'rgba(66,133,244,0.25)';
+          delete saveBtn.dataset.saved;
+          saveBtn.style.color = 'rgba(255,255,255,0.45)';
+          saveBtn.style.background = 'transparent';
+          saveBtn.querySelector('svg')?.setAttribute('fill', 'none');
         }
       }, 2000);
     });
@@ -997,7 +1003,7 @@ async function translateWord(word) {
                 try { port.disconnect(); } catch (e) {}
                 resolve(null);
               }
-            }, 3000); // 3s timeout
+            }, 6000); // 6s timeout
 
             port.onMessage.addListener((msg) => {
               if (settled) return;

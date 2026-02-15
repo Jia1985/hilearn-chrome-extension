@@ -7,10 +7,10 @@ const DEFAULT_NOTE_PATH = "Vocab-2.md";
 
 // Diagnostic: service worker startup
 console.log("ðŸŸ¢ [Background] Service worker starting up (background.js loaded)");
-function safeSendMessage(tabId, payload) {
+function safeSendMessage(tabId, payload, cb) {
   if (!tabId) return;
   chrome.tabs.sendMessage(tabId, payload, (response) => {
-    if (chrome.runtime.lastError) return; 
+    if (chrome.runtime.lastError) return;
     if (cb) cb(response);
     // ignore "Receiving end does not exist"
   });
@@ -62,6 +62,15 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.runtime.onStartup.addListener(async () => {
   const enabled = await getEnabled();
   await updateBadge(enabled);
+});
+
+// Keep service worker alive — MV3 workers are killed after ~30s idle.
+// A repeating alarm every 20s prevents that.
+chrome.alarms.create('keepAlive', { periodInMinutes: 0.33 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'keepAlive') {
+    // no-op: simply handling the alarm keeps the worker alive
+  }
 });
 
 // Click toolbar icon to toggle
@@ -203,6 +212,144 @@ async function translateInBackground(word) {
   return null;
 }
 
+// --- Detailed Vocab Lookup (enhanced Google Translate params) ---
+
+function parseDetailedResponse(data, word) {
+  const result = {
+    word: word,
+    translation: '',
+    phonetic: '',
+    definitions: [],
+    examples: [],
+    synonyms: [],
+    alternatives: []
+  };
+
+  try {
+    // data[0]: translation segments (dt=t)
+    if (data[0] && data[0][0]) {
+      result.translation = data[0][0][0] || '';
+      // Phonetic may be at data[0][0][3] (romanization of source)
+      if (data[0][0][3]) {
+        result.phonetic = data[0][0][3];
+      }
+    }
+
+    // data[1]: bilingual dictionary entries (dt=bd)
+    if (data[1] && Array.isArray(data[1])) {
+      for (const entry of data[1]) {
+        if (entry && entry[0] && Array.isArray(entry[1])) {
+          result.definitions.push({
+            pos: entry[0],
+            meanings: entry[1].slice(0, 5),
+            definition: ''
+          });
+        }
+      }
+    }
+
+    // data[11]: romanization (dt=rm) — more reliable phonetic source
+    if (data[11] && data[11][0] && data[11][0][0]) {
+      result.phonetic = data[11][0][0];
+    }
+
+    // data[12]: monolingual definitions (dt=md)
+    if (data[12] && Array.isArray(data[12])) {
+      for (const section of data[12]) {
+        if (!section || !section[0]) continue;
+        const pos = section[0];
+        const defs = section[1];
+        if (!Array.isArray(defs)) continue;
+
+        let defEntry = result.definitions.find(d => d.pos === pos);
+        if (!defEntry) {
+          defEntry = { pos, meanings: [], definition: '' };
+          result.definitions.push(defEntry);
+        }
+        if (defs[0] && defs[0][0]) {
+          defEntry.definition = defs[0][0];
+        }
+      }
+    }
+
+    // data[13]: examples (dt=ex)
+    if (data[13] && data[13][0] && Array.isArray(data[13][0])) {
+      for (const ex of data[13][0]) {
+        if (ex && ex[0]) {
+          result.examples.push(ex[0]);
+        }
+      }
+      result.examples = result.examples.slice(0, 5);
+    }
+
+    // data[14]: synonyms (dt=ss)
+    if (data[14] && Array.isArray(data[14])) {
+      for (const synGroup of data[14]) {
+        if (!synGroup || !synGroup[0]) continue;
+        const pos = synGroup[0];
+        const wordGroups = synGroup[1];
+        if (!Array.isArray(wordGroups)) continue;
+        const words = [];
+        for (const wg of wordGroups) {
+          if (Array.isArray(wg[0])) {
+            words.push(...wg[0].slice(0, 3));
+          }
+        }
+        if (words.length > 0) {
+          result.synonyms.push({ pos, words: words.slice(0, 6) });
+        }
+      }
+    }
+
+    // data[5]: alternative translations (dt=at)
+    if (data[5] && data[5][0] && data[5][0][2] && Array.isArray(data[5][0][2])) {
+      for (const alt of data[5][0][2]) {
+        if (alt && alt[0] && alt[0] !== result.translation) {
+          result.alternatives.push(alt[0]);
+        }
+      }
+      result.alternatives = result.alternatives.slice(0, 5);
+    }
+  } catch (e) {
+    console.warn('[BG] parseDetailedResponse error:', e);
+  }
+
+  return result;
+}
+
+async function fetchDetailedTranslation(word) {
+  if (!word || word.trim().length === 0) return null;
+  const cleanWord = word.trim().toLowerCase();
+
+  // Use sl=en for ASCII words, sl=auto otherwise
+  const isAscii = /^[\x00-\x7F]+$/.test(cleanWord);
+  const sl = isAscii ? 'en' : 'auto';
+
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=zh-CN`
+    + `&dt=t&dt=bd&dt=md&dt=ex&dt=ss&dt=at&dt=rm`
+    + `&q=${encodeURIComponent(cleanWord)}`;
+
+  try {
+    console.log('[BG] fetchDetailedTranslation for:', cleanWord);
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if (!res.ok) {
+      console.warn('[BG] fetchDetailedTranslation non-OK:', res.status);
+      return null;
+    }
+    const data = await res.json().catch(() => null);
+    if (!data) return null;
+
+    return parseDetailedResponse(data, cleanWord);
+  } catch (e) {
+    console.warn('[BG] fetchDetailedTranslation failed:', e);
+    return null;
+  }
+}
+
 // Use a long-lived port connection to handle translation requests reliably
 chrome.runtime.onConnect.addListener((port) => {
   let disconnected = false;
@@ -215,6 +362,19 @@ chrome.runtime.onConnect.addListener((port) => {
     console.log("ðŸ” [BG] Port connected:", port.name);
 
     port.onMessage.addListener(async (msg) => {
+      if (msg?.type === "FETCH_VOCAB_DETAIL") {
+        console.log("[BG] Port FETCH_VOCAB_DETAIL for:", msg.word);
+        try {
+          const detail = await fetchDetailedTranslation(msg.word);
+          if (disconnected) return;
+          try { port.postMessage({ type: 'VOCAB_DETAIL_RESULT', detail }); } catch {}
+        } catch (err) {
+          if (disconnected) return;
+          try { port.postMessage({ type: 'VOCAB_DETAIL_RESULT', detail: null, error: String(err) }); } catch {}
+        }
+        return;
+      }
+
       if (msg?.type !== "TRANSLATE_REQUEST") return;
 
       console.log("ðŸ” [BG] Port TRANSLATE_REQUEST for:", msg.word);
@@ -640,4 +800,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   })();
 
   return true; // keep the message channel open for the async sendResponse
+});
+
+// Handle FETCH_VOCAB_DETAIL messages from the content script (fallback for port failures)
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "FETCH_VOCAB_DETAIL") return;
+
+  console.log("[BG] onMessage FETCH_VOCAB_DETAIL for:", msg.word);
+
+  fetchDetailedTranslation(msg.word).then(detail => {
+    sendResponse({ detail });
+  }).catch(err => {
+    console.warn("[BG] FETCH_VOCAB_DETAIL error:", err);
+    sendResponse({ detail: null, error: String(err) });
+  });
+
+  return true; // async
 });
