@@ -404,7 +404,7 @@ function detectNotePathFromText(text) {
   }
 }
 
-async function appendToObsidian({ apiKey, selectedText, pageTitle, url, apiBase, notePath }) {
+async function appendToObsidian({ apiKey, selectedText, detail, pageTitle, url, apiBase, notePath }) {
   console.log("ðŸŸ¡ [API Call] appendToObsidian function called");
   console.log("ðŸŸ¡ [API Call] Parameters:", {
     hasApiKey: !!apiKey,
@@ -427,8 +427,17 @@ async function appendToObsidian({ apiKey, selectedText, pageTitle, url, apiBase,
     throw new Error("No selected text to save.");
   }
 
-  // Build the exact line format you chose
-  const line = `- **${text}** â€” ${title || new URL(url).hostname} Â· [source](${url})\n`;
+  // Build Option C format
+  const source = `[${title || new URL(url).hostname}](${url})`;
+  let line;
+  if (detail && detail.word) {
+    line = `### ${detail.word}\n`;
+    if (detail.phonetic) line += `- 📖 /${detail.phonetic}/\n`;
+    if (detail.translation) line += `- 🇨🇳 ${detail.translation}\n`;
+    line += `- 🔗 ${source}\n\n`;
+  } else {
+    line = `### ${text}\n- 🔗 ${source}\n\n`;
+  }
   console.log("ðŸŸ¡ [API Call] Formatted line to save:", line);
 
   // Use provided values or auto-detect based on word count
@@ -775,7 +784,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "OBSIDIAN_APPEND") {
     console.log("[Background] Received OBSIDIAN_APPEND message from content script");
 
-    const { selectedText, pageTitle, url } = msg.payload || {};
+    const { selectedText, detail, pageTitle, url } = msg.payload || {};
 
     (async () => {
       try {
@@ -793,6 +802,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await appendToObsidian({
           apiKey,
           selectedText,
+          detail,
           pageTitle,
           url,
           apiBase: result.obsidianApiBase

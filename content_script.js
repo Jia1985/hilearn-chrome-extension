@@ -11,12 +11,13 @@ function getSelectedText() {
 // Diagnostics: indicate content script loaded
 console.log("🔵 [Content Script] Loaded - ready to translate and save");
 
-function sendSaveToObsidian(selectedText) {
+function sendSaveToObsidian(selectedText, detail) {
   console.log("🔵 [Content Script] sendSaveToObsidian called");
   console.log("🔵 [Content Script] Selected text:", selectedText);
-  
+
   const payload = {
     selectedText: selectedText || getSelectedText(),
+    detail: detail || null,
     pageTitle: document.title,
     url: location.href,
   };
@@ -617,19 +618,6 @@ function speakWord(word) {
   }
 }
 
-// Build enriched save text from vocab detail
-function buildObsidianSaveText(detail) {
-  let text = detail.word;
-  if (detail.phonetic) text += ` /${detail.phonetic}/`;
-  text += ` — ${detail.translation}`;
-  if (detail.definitions && detail.definitions.length > 0) {
-    const defSummary = detail.definitions
-      .map(d => `(${d.pos}) ${d.meanings.join(', ')}`)
-      .join('; ');
-    text += ` | ${defSummary}`;
-  }
-  return text;
-}
 
 // Attach interactions to the popup (tabs, TTS, save, close)
 function attachPopupInteractions(popup, detail) {
@@ -686,8 +674,7 @@ function attachPopupInteractions(popup, detail) {
     });
     saveBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const saveText = buildObsidianSaveText(detail);
-      sendSaveToObsidian(saveText);
+      sendSaveToObsidian(detail.word, detail);
       // Fill the bookmark icon to indicate saved
       saveBtn.dataset.saved = '1';
       saveBtn.style.color = '#81c784';
