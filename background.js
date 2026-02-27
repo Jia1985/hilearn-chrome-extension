@@ -394,6 +394,16 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 
+// Auto-detect file path based on word count
+function detectNotePathFromText(text) {
+  const wordCount = text.trim().split(/\s+/).length;
+  if (wordCount <= 5) {
+    return "Vocab.md";
+  } else {
+    return "Content.md";
+  }
+}
+
 async function appendToObsidian({ apiKey, selectedText, pageTitle, url, apiBase, notePath }) {
   console.log("ðŸŸ¡ [API Call] appendToObsidian function called");
   console.log("ðŸŸ¡ [API Call] Parameters:", {
@@ -421,9 +431,10 @@ async function appendToObsidian({ apiKey, selectedText, pageTitle, url, apiBase,
   const line = `- **${text}** â€” ${title || new URL(url).hostname} Â· [source](${url})\n`;
   console.log("ðŸŸ¡ [API Call] Formatted line to save:", line);
 
-  // Use provided values or defaults
+  // Use provided values or auto-detect based on word count
   const baseUrl = apiBase || DEFAULT_OBSIDIAN_BASE;
-  const targetNote = notePath || DEFAULT_NOTE_PATH;
+  const targetNote = notePath || detectNotePathFromText(text);
+  console.log("ðŸŸ¡ [API Call] Auto-detected file:", targetNote, `(${text.split(/\s+/).length} words)`);
   try{
   // First, test API connectivity to discover available endpoints
   await testApiConnectivity(baseUrl, apiKey);
@@ -436,7 +447,7 @@ async function appendToObsidian({ apiKey, selectedText, pageTitle, url, apiBase,
   // 4. /notes/{path} or /files/{path}
   
   const encodePath = (p) => p.split("/").map(encodeURIComponent).join("/");
-  const endpointBase = `${baseUrl.replace(/\/$/, "")}/vault/${encodeURIComponent(notePath)}`;
+  const endpointBase = `${baseUrl.replace(/\/$/, "")}/vault/${encodeURIComponent(targetNote)}`;
   const endpoint = endpointBase;
 
 
@@ -654,19 +665,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       console.log("ðŸŸ¢ [Background] Step 1: Getting settings from storage...");
       const result = await chrome.storage.sync.get([
         "obsidianApiKey",
-        "obsidianApiBase",
-        "obsidianNotePath"
+        "obsidianApiBase"
       ]);
-      
+
       console.log("ðŸŸ¢ [Background] Storage result:", {
         hasApiKey: !!result.obsidianApiKey,
-        apiBase: result.obsidianApiBase,
-        notePath: result.obsidianNotePath
+        apiBase: result.obsidianApiBase
       });
-      
+
       const apiKey = result.obsidianApiKey;
       const apiBase = result.obsidianApiBase;
-      const notePath = result.obsidianNotePath;
       
       if (!apiKey) {
         const errorMsg = "API key not set";
@@ -701,8 +709,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         selectedText: info.selectionText,
         pageTitle: tab.title,
         url: tab.url,
-        apiBase,
-        notePath
+        apiBase
+        // notePath intentionally omitted to enable auto-detection
       });
       
       console.log("ðŸŸ¢ [Background] âœ… Successfully saved to Obsidian!");
@@ -761,59 +769,55 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
 
 
-// Handle OBSIDIAN_APPEND messages from the content script
+// Handle all content script messages in a single listener to avoid
+// multiple listeners closing the message channel prematurely.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type !== "OBSIDIAN_APPEND") return;
+  if (msg?.type === "OBSIDIAN_APPEND") {
+    console.log("[Background] Received OBSIDIAN_APPEND message from content script");
 
-  console.log("[Background] Received OBSIDIAN_APPEND message from content script");
+    const { selectedText, pageTitle, url } = msg.payload || {};
 
-  const { selectedText, pageTitle, url } = msg.payload || {};
+    (async () => {
+      try {
+        const result = await chrome.storage.sync.get([
+          "obsidianApiKey",
+          "obsidianApiBase"
+        ]);
 
-  (async () => {
-    try {
-      const result = await chrome.storage.sync.get([
-        "obsidianApiKey",
-        "obsidianApiBase",
-        "obsidianNotePath"
-      ]);
+        const apiKey = result.obsidianApiKey;
+        if (!apiKey) {
+          sendResponse({ ok: false, error: "API key not set. Please configure it in extension options." });
+          return;
+        }
 
-      const apiKey = result.obsidianApiKey;
-      if (!apiKey) {
-        sendResponse({ ok: false, error: "API key not set. Please configure it in extension options." });
-        return;
+        await appendToObsidian({
+          apiKey,
+          selectedText,
+          pageTitle,
+          url,
+          apiBase: result.obsidianApiBase
+        });
+
+        sendResponse({ ok: true });
+      } catch (err) {
+        console.error("[Background] OBSIDIAN_APPEND error:", err);
+        sendResponse({ ok: false, error: String(err?.message || err) });
       }
+    })();
 
-      await appendToObsidian({
-        apiKey,
-        selectedText,
-        pageTitle,
-        url,
-        apiBase: result.obsidianApiBase,
-        notePath: result.obsidianNotePath
-      });
+    return true;
+  }
 
-      sendResponse({ ok: true });
-    } catch (err) {
-      console.error("[Background] OBSIDIAN_APPEND error:", err);
-      sendResponse({ ok: false, error: String(err?.message || err) });
-    }
-  })();
+  if (msg?.type === "FETCH_VOCAB_DETAIL") {
+    console.log("[BG] onMessage FETCH_VOCAB_DETAIL for:", msg.word);
 
-  return true; // keep the message channel open for the async sendResponse
-});
+    fetchDetailedTranslation(msg.word).then(detail => {
+      sendResponse({ detail });
+    }).catch(err => {
+      console.warn("[BG] FETCH_VOCAB_DETAIL error:", err);
+      sendResponse({ detail: null, error: String(err) });
+    });
 
-// Handle FETCH_VOCAB_DETAIL messages from the content script (fallback for port failures)
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type !== "FETCH_VOCAB_DETAIL") return;
-
-  console.log("[BG] onMessage FETCH_VOCAB_DETAIL for:", msg.word);
-
-  fetchDetailedTranslation(msg.word).then(detail => {
-    sendResponse({ detail });
-  }).catch(err => {
-    console.warn("[BG] FETCH_VOCAB_DETAIL error:", err);
-    sendResponse({ detail: null, error: String(err) });
-  });
-
-  return true; // async
+    return true;
+  }
 });
