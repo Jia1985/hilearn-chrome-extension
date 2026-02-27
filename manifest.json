@@ -1,6 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "HiLearn",
+  "name": "HiLearn Chrome Extension",
+  "description": "Select text to translate, look up vocabulary, and save to Obsidian.",
   "version": "0.1.0",
   "permissions": ["storage", "tabs", "contextMenus", "notifications", "alarms"],
   "host_permissions": ["<all_urls>"],
