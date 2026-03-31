@@ -699,7 +699,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         // Try to show notification or alert
         chrome.notifications.create({
           type: "basic",
-          iconUrl: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><text>âš ï¸</text></svg>",
+          iconUrl: "icon48.png",
           title: "Vocab Saver Error",
           message: "Please set your API key in extension options"
         });
@@ -735,7 +735,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       // Show success notification
       chrome.notifications.create({
         type: "basic",
-        iconUrl: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><text>âœ…</text></svg>",
+        iconUrl: "icon48.png",
         title: "Vocab Saver",
         message: `Saved: "${info.selectionText.substring(0, 50)}..."`
       });
@@ -766,7 +766,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       // Show error notification
       chrome.notifications.create({
         type: "basic",
-        iconUrl: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><text>âŒ</text></svg>",
+        iconUrl: "icon48.png",
         title: "Vocab Saver Error",
         message: errorMsg.substring(0, 100)
       });
